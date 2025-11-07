@@ -25,11 +25,11 @@
 
 FROM --platform=linux/amd64 debian:bookworm as debian-amd64
 RUN apt-get update
-RUN apt-get install -y libssh2-1-dev libssl-dev zlib1g-dev
+RUN apt-get install -y libssh2-1-dev libssl-dev zlib1g-dev libc6-dev linux-libc-dev
 
 FROM --platform=linux/arm64 debian:bookworm as debian-arm64
 RUN apt-get update
-RUN apt-get install -y libssh2-1-dev libssl-dev zlib1g-dev
+RUN apt-get install -y libssh2-1-dev libssl-dev zlib1g-dev libc6-dev linux-libc-dev
 
 FROM --platform=$BUILDPLATFORM golang:1.20.5-bookworm as builder
 
@@ -40,13 +40,19 @@ ARG HTTP_PROXY=
 ARG HTTPS_PROXY=
 
 RUN apt-get update
-RUN apt-get install -y gcc binutils libfindbin-libs-perl cmake libssh2-1-dev libssl-dev zlib1g-dev
+RUN apt-get install -y gcc binutils libfindbin-libs-perl cmake libssh2-1-dev libssl-dev zlib1g-dev \
+    build-essential pkg-config wget ca-certificates
 
 RUN if [ "$(arch)" != "aarch64" ] ; then \
-        apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu ; \
+    apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu && \
+    echo "Installed cross compiler for aarch64" ; \
+    else \
+    echo "Running on aarch64, no cross compiler needed" ; \
     fi
 RUN if [ "$(arch)" != "x86_64" ] ; then \
-        apt-get install -y gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu ; \
+    echo "Running on non-x86_64, native x86_64 gcc should work for cross compilation" ; \
+    else \
+    echo "Running on x86_64, native gcc will be used" ; \
     fi
 
 RUN go install github.com/vektra/mockery/v2@v2.20.0
@@ -62,20 +68,32 @@ COPY --from=debian-arm64 /lib/aarch64-linux-gnu /rootfs-arm64/lib/aarch64-linux-
 
 
 RUN for arch in aarch64 x86_64 ; do \
-        mkdir -p /tmp/build/${arch} && cd /tmp/build/${arch} && \
-        wget https://github.com/libgit2/libgit2/archive/refs/tags/v1.3.2.tar.gz -O - | tar -xz && \
-        cd libgit2-1.3.2 && \
-        mkdir build && cd build && \
-        if [ "$arch" = "aarch64" ] ; then \
-            cmake .. -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-                -DBUILD_SHARED_LIBS=ON -DCMAKE_SYSROOT=/rootfs-arm64 \
-                -DCMAKE_INSTALL_PREFIX=/usr/local/deps/${arch} ; \
-        elif [ "$arch" = "x86_64" ] ; then \
-            cmake .. -DCMAKE_C_COMPILER=x86_64-linux-gnu-gcc \
-                -DBUILD_SHARED_LIBS=ON -DCMAKE_SYSROOT=/rootfs-amd64 \
-                -DCMAKE_INSTALL_PREFIX=/usr/local/deps/${arch} ; \
-        fi && \
-        make -j install ; \
+    echo "Building libgit2 for ${arch}" && \
+    mkdir -p /tmp/build/${arch} && cd /tmp/build/${arch} && \
+    wget https://github.com/libgit2/libgit2/archive/refs/tags/v1.3.2.tar.gz -O - | tar -xz && \
+    cd libgit2-1.3.2 && \
+    mkdir build && cd build && \
+    if [ "$arch" = "aarch64" ] ; then \
+    cmake .. -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+    -DCMAKE_SYSTEM_NAME=Linux \
+    -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+    -DBUILD_SHARED_LIBS=ON -DCMAKE_SYSROOT=/rootfs-arm64 \
+    -DCMAKE_INSTALL_PREFIX=/usr/local/deps/${arch} \
+    -DCMAKE_FIND_ROOT_PATH=/rootfs-arm64 \
+    -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+    -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+    -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+    -DUSE_HTTPS=OFF -DUSE_SSH=OFF -DBUILD_TESTS=OFF ; \
+    elif [ "$arch" = "x86_64" ] ; then \
+    # For x86_64, use native compilation to avoid sysroot issues \
+    cmake .. -DCMAKE_C_COMPILER=gcc \
+    -DCMAKE_SYSTEM_NAME=Linux \
+    -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
+    -DBUILD_SHARED_LIBS=ON \
+    -DCMAKE_INSTALL_PREFIX=/usr/local/deps/${arch} \
+    -DUSE_HTTPS=OFF -DUSE_SSH=OFF -DBUILD_TESTS=OFF ; \
+    fi && \
+    make -j$(nproc) install ; \
     done
 
 
@@ -92,13 +110,13 @@ ARG GO_PLUGINS=
 
 RUN --mount=type=cache,target=/root/.cache/go-build \
     if [ "$TARGETPLATFORM" = "linux/arm64" ] ; then \
-        ln -s /usr/local/deps/aarch64 /usr/local/deps/target && \
-        export CC=aarch64-linux-gnu-gcc && \
-        export GOARCH=arm64 ; \
+    ln -s /usr/local/deps/aarch64 /usr/local/deps/target && \
+    export CC=aarch64-linux-gnu-gcc && \
+    export GOARCH=arm64 ; \
     else \
-        ln -s /usr/local/deps/x86_64 /usr/local/deps/target && \
-        export CC=x86_64-linux-gnu-gcc && \
-        export GOARCH=amd64 ; \
+    ln -s /usr/local/deps/x86_64 /usr/local/deps/target && \
+    export CC=gcc && \
+    export GOARCH=amd64 ; \
     fi && \
     export PKG_CONFIG_PATH=/usr/local/deps/target/lib/pkgconfig && \
     export CGO_ENABLED=1 &&\
@@ -107,9 +125,9 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # remove symlink in lib, we will recreate in final image
 RUN cd /usr/local/deps/target/lib && \
     for file in *.so* ; do \
-        if [ -L $file ] ; then \
-            unlink $file ; \
-        fi \
+    if [ -L $file ] ; then \
+    unlink $file ; \
+    fi \
     done
 
 
@@ -119,16 +137,16 @@ RUN apt-get update && \
     apt-get install -y python3-dev python3-pip tar pkg-config curl libssh2-1 zlib1g libffi-dev default-libmysqlclient-dev libpq-dev tini git openssh-client corkscrew && \
     apt-get clean && \
     rm -fr /usr/share/doc/* \
-           /usr/share/info/* \
-           /usr/share/linda/* \
-           /usr/share/lintian/overrides/* \
-           /usr/share/locale/* \
-           /usr/share/man/* \
-           /usr/share/doc/kde/HTML/* \
-           /usr/share/gnome/help/* \
-           /usr/share/locale/* \
-           /usr/share/omf/*/*-*.emf \
-           /var/lib/apt/lists/*
+    /usr/share/info/* \
+    /usr/share/linda/* \
+    /usr/share/lintian/overrides/* \
+    /usr/share/locale/* \
+    /usr/share/man/* \
+    /usr/share/doc/kde/HTML/* \
+    /usr/share/gnome/help/* \
+    /usr/share/locale/* \
+    /usr/share/omf/*/*-*.emf \
+    /var/lib/apt/lists/*
 
 EXPOSE 8080
 
